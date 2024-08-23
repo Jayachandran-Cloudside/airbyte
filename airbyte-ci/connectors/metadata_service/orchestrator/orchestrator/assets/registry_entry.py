@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Union
 
 import orchestrator.hacks as HACKS
 import pandas as pd
+import semver
 import sentry_sdk
 from dagster import AutoMaterializePolicy, DynamicPartitionsDefinition, MetadataValue, OpExecutionContext, Output, asset
 from dagster_gcp.gcs.file_manager import GCSFileHandle, GCSFileManager
@@ -73,6 +74,27 @@ def apply_spec_to_registry_entry(registry_entry: dict, spec_cache: SpecCache, re
     return entry_with_spec
 
 
+@sentry_sdk.trace
+def apply_release_candidates(
+    registry_entry: dict,
+    spec_cache: SpecCache,
+    registry_name: str,
+    release_candidate_metadata_entries: Optional[List[LatestMetadataEntry]] = None,
+) -> dict:
+    if not release_candidate_metadata_entries:
+        return registry_entry
+    registry_entry = copy.deepcopy(registry_entry)
+    registry_entry.setdefault("releases", {})
+    registry_entry["releases"]["releaseCandidates"] = {
+        entry.metadata_definition.data.dockerImageTag: {
+            "rolloutConfiguration": entry.metadata_definition.data.releases.rolloutConfiguration.dict(),
+            "registryEntry": generate_registry_entry(entry, spec_cache, registry_name).dict(),
+        }
+        for entry in release_candidate_metadata_entries
+    }
+    return registry_entry
+
+
 def calculate_migration_documentation_url(releases_or_breaking_change: dict, documentation_url: str, version: Optional[str] = None) -> str:
     """Calculate the migration documentation url for the connector releases.
 
@@ -90,25 +112,26 @@ def calculate_migration_documentation_url(releases_or_breaking_change: dict, doc
 
 
 @deep_copy_params
-def apply_connector_release_defaults(metadata: dict) -> Optional[pd.DataFrame]:
-    metadata_releases = metadata.get("releases")
+def apply_connector_breaking_changes_defaults(metadata: dict) -> Optional[pd.DataFrame]:
     documentation_url = metadata.get("documentationUrl")
-    if metadata_releases is None:
+    if metadata.get("releases", {}).get("breakingChanges") is None:
         return None
 
+    final_metadata_releases = {}
+
     # apply defaults for connector releases
-    metadata_releases["migrationDocumentationUrl"] = calculate_migration_documentation_url(metadata_releases, documentation_url)
+    final_metadata_releases["migrationDocumentationUrl"] = calculate_migration_documentation_url(metadata["releases"], documentation_url)
 
     # releases has a dictionary field called breakingChanges, where the key is the version and the value is the data for the breaking change
     # each breaking change has a migrationDocumentationUrl field that is optional, so we need to apply defaults to it
-    breaking_changes = metadata_releases["breakingChanges"]
+    breaking_changes = metadata["releases"]["breakingChanges"]
     if breaking_changes is not None:
         for version, breaking_change in breaking_changes.items():
             breaking_change["migrationDocumentationUrl"] = calculate_migration_documentation_url(
                 breaking_change, documentation_url, version
             )
-
-    return metadata_releases
+        final_metadata_releases["breakingChanges"] = breaking_changes
+    return final_metadata_releases
 
 
 @deep_copy_params
@@ -255,8 +278,7 @@ def metadata_to_registry_entry(metadata_entry: LatestMetadataEntry, override_reg
 
     # apply generated fields
     overridden_metadata_data["iconUrl"] = metadata_entry.icon_url
-    overridden_metadata_data["releases"] = apply_connector_release_defaults(overridden_metadata_data)
-
+    overridden_metadata_data["releases"] = apply_connector_breaking_changes_defaults(overridden_metadata_data)
     return overridden_metadata_data
 
 
@@ -330,29 +352,55 @@ def persist_registry_entry_to_json(
     return file_handle
 
 
+def generate_registry_entry(
+    metadata_entry: LatestMetadataEntry,
+    spec_cache: SpecCache,
+    registry_name: str,
+    release_candidate_metadata_entries: Optional[List[LatestMetadataEntry]] = None,
+) -> PolymorphicRegistryEntry:
+    """Generate a registry entry given a metadata entry.
+    Enriches the metadata entry with spec and release candidate information.
+
+    Args:
+        metadata_entry (LatestMetadataEntry): The metadata entry.
+        spec_cache (SpecCache): The spec cache.
+        registry_name (str): The name of the registry_entry. One of "cloud" or "oss".
+        release_candidate_metadata_entries (Optional[List[LatestMetadataEntry]], optional): The release candidate metadata entries. Defaults to None.
+
+    Returns:
+        PolymorphicRegistryEntry: The registry entry (could be a source or destination entry).
+    """
+    raw_entry_dict = metadata_to_registry_entry(metadata_entry, registry_name)
+    registry_entry_with_spec = apply_spec_to_registry_entry(raw_entry_dict, spec_cache, registry_name)
+    registry_entry_with_release_candidates = apply_release_candidates(
+        registry_entry_with_spec, spec_cache, registry_name, release_candidate_metadata_entries
+    )
+
+    _, ConnectorModel = get_connector_type_from_registry_entry(registry_entry_with_release_candidates)
+
+    return ConnectorModel.parse_obj(registry_entry_with_release_candidates)
+
+
 @sentry_sdk.trace
 def generate_and_persist_registry_entry(
     metadata_entry: LatestMetadataEntry,
     spec_cache: SpecCache,
     metadata_directory_manager: GCSFileManager,
     registry_name: str,
+    release_candidate_metadata_entries: Optional[List[LatestMetadataEntry]] = None,
 ) -> str:
     """Generate the selected registry from the metadata files, and persist it to GCS.
 
     Args:
-        context (OpExecutionContext): The execution context.
-        metadata_entry (List[LatestMetadataEntry]): The metadata definitions.
-        cached_specs (OutputDataFrame): The cached specs.
-
+        metadata_entry (List[LatestMetadataEntry]): The metadata entry.
+        spec_cache (SpecCache): The spec cache.
+        metadata_directory_manager (GCSFileManager): The metadata directory manager.
+        registry_name (str): The name of the registry_entry. One of "cloud" or "oss".
+        release_candidate_metadata_entries (Optional[List[LatestMetadataEntry]]): The release candidate metadata entries.
     Returns:
-        Output[ConnectorRegistryV0]: The registry.
+        str: The public url of the registry entry.
     """
-    raw_entry_dict = metadata_to_registry_entry(metadata_entry, registry_name)
-    registry_entry_with_spec = apply_spec_to_registry_entry(raw_entry_dict, spec_cache, registry_name)
-
-    _, ConnectorModel = get_connector_type_from_registry_entry(registry_entry_with_spec)
-
-    registry_model = ConnectorModel.parse_obj(registry_entry_with_spec)
+    registry_model = generate_registry_entry(metadata_entry, spec_cache, registry_name, release_candidate_metadata_entries)
 
     file_handle = persist_registry_entry_to_json(registry_model, registry_name, metadata_entry, metadata_directory_manager)
 
@@ -555,14 +603,56 @@ def metadata_entry(context: OpExecutionContext) -> Output[Optional[LatestMetadat
     return Output(value=metadata_entry, metadata=dagster_metadata)
 
 
+def find_release_candidates_for_metadata_entry(
+    metadata_entry: LatestMetadataEntry, release_candidate_metadata_entries: Optional[List[LatestMetadataEntry]]
+) -> Optional[List[LatestMetadataEntry]]:
+    """Find the release candidates metadata definition for the given metadata entry.
+
+    Args:
+        metadata_entry (LatestMetadataEntry): The metadata entry.
+        release_candidate_metadata_entries (List[LatestMetadataEntry]): The release candidate metadata definitions.
+
+    Returns:
+        Optional[List[LatestMetadataEntry]]: The release candidates metadata definition.
+    """
+    if not release_candidate_metadata_entries:
+        return None
+
+    current_semver_version = semver.Version.parse(metadata_entry.metadata_definition.data.dockerImageTag)
+
+    # find the release candidate metadata definition that matches the given metadata entry
+    matching_release_candidates = [
+        release_candidate_metadata
+        for release_candidate_metadata in release_candidate_metadata_entries
+        if release_candidate_metadata.metadata_definition.data.dockerRepository == metadata_entry.metadata_definition.data.dockerRepository
+        # Only consider release candidates with a higher version than the metadata entry
+        and semver.Version.parse(release_candidate_metadata.metadata_definition.data.dockerImageTag) > current_semver_version
+    ]
+
+    if not matching_release_candidates:
+        return None
+
+    # We currently want to enforce upstream that there's always only one release candidate per connector
+    # But in case this is not the case, we'll take the one with the closest version to the current one
+    sorted_release_candidates = sorted(
+        matching_release_candidates, key=lambda x: semver.Version.parse(x.metadata_definition.data.dockerImageTag)
+    )
+    # We keep it a single item list until we have a use case for multiple release candidates
+    return [sorted_release_candidates[0]]
+
+
 @asset(
-    required_resource_keys={"slack", "root_metadata_directory_manager"},
+    required_resource_keys={"slack", "root_metadata_directory_manager", "release_candidate_metadata_file_blobs"},
     group_name=GROUP_NAME,
     partitions_def=metadata_partitions_def,
     auto_materialize_policy=AutoMaterializePolicy.eager(max_materializations_per_minute=MAX_METADATA_PARTITION_RUN_REQUEST),
 )
 @sentry.instrument_asset_op
-def registry_entry(context: OpExecutionContext, metadata_entry: Optional[LatestMetadataEntry]) -> Output[Optional[dict]]:
+def registry_entry(
+    context: OpExecutionContext,
+    metadata_entry: Optional[LatestMetadataEntry],
+    release_candidate_metadata_entries: Optional[List[LatestMetadataEntry]],
+) -> Output[Optional[dict]]:
     """
     Generate the registry entry files from the given metadata file, and persist it to GCS.
     """
@@ -588,9 +678,28 @@ def registry_entry(context: OpExecutionContext, metadata_entry: Optional[LatestM
 
     root_metadata_directory_manager = context.resources.root_metadata_directory_manager
     enabled_registries, disabled_registries = get_registry_status_lists(metadata_entry)
+    matching_release_candidates = find_release_candidates_for_metadata_entry(metadata_entry, release_candidate_metadata_entries)
+    release_candidates_metadata = {
+        "release_candidates": [rc_entry.file_path for rc_entry in matching_release_candidates] if matching_release_candidates else [],
+    }
+    if matching_release_candidates:
+        PublishConnectorLifecycle.log(
+            context,
+            PublishConnectorLifecycleStage.REGISTRY_ENTRY_GENERATION,
+            StageStatus.IN_PROGRESS,
+            f"Found release candidate metadata for {metadata_entry.file_path}",
+            user_identifier=user_identifier,
+            commit_sha=commit_sha,
+        )
 
     persisted_registry_entries = {
-        registry_name: generate_and_persist_registry_entry(metadata_entry, spec_cache, root_metadata_directory_manager, registry_name)
+        registry_name: generate_and_persist_registry_entry(
+            metadata_entry,
+            spec_cache,
+            root_metadata_directory_manager,
+            registry_name,
+            release_candidate_metadata_entries=matching_release_candidates,
+        )
         for registry_name in enabled_registries
     }
 
@@ -613,6 +722,7 @@ def registry_entry(context: OpExecutionContext, metadata_entry: Optional[LatestM
     }
 
     dagster_metadata = {
+        **release_candidates_metadata,
         **dagster_metadata_persist,
         **dagster_metadata_delete,
     }

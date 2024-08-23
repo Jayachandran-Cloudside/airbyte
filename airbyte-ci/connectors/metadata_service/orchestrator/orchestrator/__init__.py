@@ -29,6 +29,7 @@ from orchestrator.jobs.registry import (
     generate_oss_registry,
     generate_registry_entry,
     generate_registry_reports,
+    refresh_release_candidate_metadata_entries,
 )
 from orchestrator.logging.sentry import setup_dagster_sentry
 from orchestrator.resources.gcp import gcp_gcs_client, gcs_directory_blobs, gcs_file_blob, gcs_file_manager
@@ -93,6 +94,9 @@ METADATA_RESOURCE_TREE = {
     ),
     "latest_metadata_file_blobs": gcs_directory_blobs.configured(
         {"gcs_bucket": {"env": "METADATA_BUCKET"}, "prefix": METADATA_FOLDER, "match_regex": f".*latest/{METADATA_FILE_NAME}$"}
+    ),
+    "release_candidate_metadata_file_blobs": gcs_directory_blobs.configured(
+        {"gcs_bucket": {"env": "METADATA_BUCKET"}, "prefix": METADATA_FOLDER, "match_regex": f".*release_candidate/{METADATA_FILE_NAME}$"}
     ),
 }
 
@@ -178,12 +182,18 @@ SENSORS = [
         gcs_blobs_resource_key="latest_nightly_complete_file_blobs",
         interval=(1 * 60 * 60),
     ),
+    new_gcs_blobs_sensor(
+        job=refresh_release_candidate_metadata_entries,
+        resources_def=METADATA_RESOURCE_TREE,
+        gcs_blobs_resource_key="release_candidate_metadata_file_blobs",
+        interval=60,
+    ),
 ]
 
 SCHEDULES = [
     ScheduleDefinition(job=add_new_metadata_partitions, cron_schedule="*/2 * * * *", tags={"dagster/priority": HIGH_QUEUE_PRIORITY}),
     ScheduleDefinition(
-        cron_schedule="0 1 * * *",  # Daily at 1am US/Pacific
+        cron_schedule="*/2 * * * *",  # Every 2 minutes
         execution_timezone="US/Pacific",
         job=remove_stale_metadata_partitions,
     ),
@@ -204,6 +214,7 @@ JOBS = [
     add_new_metadata_partitions,
     remove_stale_metadata_partitions,
     generate_stale_gcs_latest_metadata_file,
+    refresh_release_candidate_metadata_entries,
 ]
 
 """

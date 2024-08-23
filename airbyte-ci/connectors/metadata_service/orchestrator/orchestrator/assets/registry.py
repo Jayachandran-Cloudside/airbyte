@@ -85,7 +85,7 @@ def generate_and_persist_registry(
     registry_entry_file_blobs: List[storage.Blob],
     registry_directory_manager: GCSFileManager,
     registry_name: str,
-    latest_connnector_metrics: dict,
+    latest_connector_metrics: dict,
 ) -> Output[ConnectorRegistryV0]:
     """Generate the selected registry from the metadata files, and persist it to GCS.
 
@@ -106,12 +106,12 @@ def generate_and_persist_registry(
     registry_dict = {"sources": [], "destinations": []}
     for blob in registry_entry_file_blobs:
         connector_type, registry_entry = read_registry_entry_blob(blob)
-        plural_connector_type = f"{connector_type}s"
+        plural_connector_type = f"{connector_type.value}s"
 
         # We santiize the registry entry to ensure its in a format
         # that can be parsed by pydantic.
         registry_entry_dict = to_json_sanitized_dict(registry_entry)
-        enriched_registry_entry_dict = apply_metrics_to_registry_entry(registry_entry_dict, connector_type, latest_connnector_metrics)
+        enriched_registry_entry_dict = apply_metrics_to_registry_entry(registry_entry_dict, connector_type, latest_connector_metrics)
 
         registry_dict[plural_connector_type].append(enriched_registry_entry_dict)
 
@@ -141,20 +141,19 @@ def generate_and_persist_registry(
     group_name=GROUP_NAME,
 )
 @sentry.instrument_asset_op
-def persisted_oss_registry(context: OpExecutionContext, latest_connnector_metrics: dict) -> Output[ConnectorRegistryV0]:
+def persisted_oss_registry(context: OpExecutionContext, latest_connector_metrics: dict) -> Output[ConnectorRegistryV0]:
     """
     This asset is used to generate the oss registry from the registry entries.
     """
     registry_name = "oss"
     registry_directory_manager = context.resources.registry_directory_manager
     latest_oss_registry_entries_file_blobs = context.resources.latest_oss_registry_entries_file_blobs
-
     return generate_and_persist_registry(
         context=context,
         registry_entry_file_blobs=latest_oss_registry_entries_file_blobs,
         registry_directory_manager=registry_directory_manager,
         registry_name=registry_name,
-        latest_connnector_metrics=latest_connnector_metrics,
+        latest_connector_metrics=latest_connector_metrics,
     )
 
 
@@ -163,20 +162,20 @@ def persisted_oss_registry(context: OpExecutionContext, latest_connnector_metric
     group_name=GROUP_NAME,
 )
 @sentry.instrument_asset_op
-def persisted_cloud_registry(context: OpExecutionContext, latest_connnector_metrics: dict) -> Output[ConnectorRegistryV0]:
+def persisted_cloud_registry(context: OpExecutionContext, latest_connector_metrics: dict) -> Output[ConnectorRegistryV0]:
     """
     This asset is used to generate the cloud registry from the registry entries.
     """
     registry_name = "cloud"
     registry_directory_manager = context.resources.registry_directory_manager
     latest_cloud_registry_entries_file_blobs = context.resources.latest_cloud_registry_entries_file_blobs
-
+    latest_connector_metrics = {}
     return generate_and_persist_registry(
         context=context,
         registry_entry_file_blobs=latest_cloud_registry_entries_file_blobs,
         registry_directory_manager=registry_directory_manager,
         registry_name=registry_name,
-        latest_connnector_metrics=latest_connnector_metrics,
+        latest_connector_metrics=latest_connector_metrics,
     )
 
 

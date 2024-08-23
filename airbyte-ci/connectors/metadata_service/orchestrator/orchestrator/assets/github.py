@@ -102,8 +102,21 @@ def github_metadata_definitions(context):
     return Output(metadata_definitions, metadata={"preview": [md.json() for md in metadata_definitions]})
 
 
+def entry_should_be_on_gcs(metadata_entry: LatestMetadataEntry) -> bool:
+    if metadata_entry.metadata_definition.data.supportLevel == "archived":
+        return False
+    if getattr(metadata_entry.metadata_definition.releases, "isReleaseCandidate", False):
+        return False
+    if (
+        datetime.datetime.strptime(metadata_entry.last_modified, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=datetime.timezone.utc)
+        > datetime.datetime.now(datetime.timezone.utc) - PUBLISH_GRACE_PERIOD
+    ):
+        return False
+    return True
+
+
 @asset(required_resource_keys={"slack"}, group_name=GROUP_NAME)
-def stale_gcs_latest_metadata_file(context, github_metadata_definitions: list, metadata_definitions: list) -> OutputDataFrame:
+def stale_gcs_latest_metadata_file(context, github_metadata_definitions: list, latest_metadata_entries: list) -> OutputDataFrame:
     """
     Return a list of all metadata files in the github repo and denote whether they are stale or not.
 
@@ -111,18 +124,14 @@ def stale_gcs_latest_metadata_file(context, github_metadata_definitions: list, m
     """
     latest_versions_on_gcs = {
         metadata_entry.metadata_definition.data.dockerRepository: metadata_entry.metadata_definition.data.dockerImageTag
-        for metadata_entry in metadata_definitions
+        for metadata_entry in latest_metadata_entries
         if metadata_entry.metadata_definition.data.supportLevel != "archived"
     }
 
-    now = datetime.datetime.now(datetime.timezone.utc)
     latest_versions_on_github = {
         metadata_entry.metadata_definition.data.dockerRepository: metadata_entry.metadata_definition.data.dockerImageTag
         for metadata_entry in github_metadata_definitions
-        if metadata_entry.metadata_definition.data.supportLevel
-        != "archived"  # We give a 2 hour grace period for the metadata to be updated
-        and datetime.datetime.strptime(metadata_entry.last_modified, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=datetime.timezone.utc)
-        < now - PUBLISH_GRACE_PERIOD
+        if entry_should_be_on_gcs(metadata_entry)
     }
 
     stale_connectors = []

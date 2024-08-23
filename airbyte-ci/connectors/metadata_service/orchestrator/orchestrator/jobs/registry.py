@@ -23,6 +23,13 @@ generate_registry_entry = define_asset_job(
     partitions_def=registry_entry.metadata_partitions_def,
 )
 
+release_candidate_metadata_entries_inclusive = AssetSelection.keys("release_candidate_metadata_entries").upstream()
+refresh_release_candidate_metadata_entries = define_asset_job(
+    name="refresh_release_candidate_metadata_entries",
+    selection=release_candidate_metadata_entries_inclusive,
+    tags={"dagster/priority": HIGH_QUEUE_PRIORITY},
+)
+
 
 @op(required_resource_keys={"all_metadata_file_blobs"})
 def remove_stale_metadata_partitions_op(context):
